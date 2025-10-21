@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import time, random, re, requests
+import time, random, re, requests, os, hashlib
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
@@ -19,13 +19,38 @@ orte_liste = orte_df["name"].tolist()
 HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36"}
 
 # =====================================================
+# Cache-Setup (lokal)
+# =====================================================
+CACHE_DIR = "cache"
+os.makedirs(CACHE_DIR, exist_ok=True)
+
+def cache_filename(ort, radius):
+    key = f"{ort}_{radius}"
+    key_hash = hashlib.md5(key.encode()).hexdigest()
+    return os.path.join(CACHE_DIR, f"{key_hash}.parquet")
+
+def save_cached_data(df, ort, radius):
+    path = cache_filename(ort, radius)
+    df.attrs["scraped_at"] = time.strftime("%d.%m.%Y %H:%M:%S")
+    df.to_parquet(path)
+
+def load_cached_data(ort, radius, max_age_hours=24):
+    path = cache_filename(ort, radius)
+    if os.path.exists(path):
+        age_hours = (time.time() - os.path.getmtime(path)) / 3600
+        if age_hours < max_age_hours:
+            df = pd.read_parquet(path)
+            df.attrs["scraped_at"] = df.attrs.get("scraped_at", time.strftime("%d.%m.%Y %H:%M:%S"))
+            return df
+    return None
+
+# =====================================================
 # Scraper-Funktionen
 # =====================================================
 def get_html(url):
     r = requests.get(url, headers=HEADERS, timeout=30)
     r.raise_for_status()
     return r.text
-
 
 def parse_price(val: str):
     if not val:
@@ -37,7 +62,6 @@ def parse_price(val: str):
     except ValueError:
         return None
 
-
 def parse_results_page(html, base):
     soup = BeautifulSoup(html, "html.parser")
     links = []
@@ -47,18 +71,15 @@ def parse_results_page(html, base):
             links.append(urljoin(base, href.split("?")[0]))
     return list(dict.fromkeys(links))
 
-
 def get_total_pages(html):
     soup = BeautifulSoup(html, "html.parser")
     pages = {int(m.group(1)) for a in soup.find_all("a", href=True)
              if (m := re.search(r"/seite:(\d+)", a["href"]))}
     return max(pages) if pages else 1
 
-
 def parse_ad_page(html, url):
     soup = BeautifulSoup(html, "html.parser")
 
-    # --- Hauptbereich nur für die eigentliche Anzeige ---
     main_section = (
         soup.select_one("#viewad-main")
         or soup.select_one("main")
@@ -66,23 +87,16 @@ def parse_ad_page(html, url):
         or soup
     )
     text = main_section.get_text(" ", strip=True)
-
-    # --- Titel ---
     title = soup.find("h1").get_text(strip=True) if soup.find("h1") else "Unbekannt"
 
-    # --- Preis ---
     price = None
     vb_flag = False
-
-    # Normaler Preis (z. B. 140.000 €)
     m_price = re.search(r"(Kaufpreis|Preis|Gesamtpreis)?\s*([\d\.\s,]+)\s*(€|EUR)", text, re.I)
     if m_price:
         price = parse_price(m_price.group(2))
-        # Prüfen ob VB in der Nähe steht
         if re.search(r"\bVB\b", text[m_price.end():m_price.end() + 20], re.I):
             vb_flag = True
     else:
-        # Nur VB ohne Preis (z. B. "VB" vor PLZ)
         m_vb = re.search(r"\bVB\b", text)
         if m_vb:
             part = text[m_vb.end():m_vb.end() + 20]
@@ -90,7 +104,6 @@ def parse_ad_page(html, url):
                 vb_flag = True
                 price = 0.0
 
-    # --- Fläche ---
     area = None
     if (m := re.search(r"(\d{1,5}[,\.\s]?\d{0,2})\s?m(?:²|2)\b", text)):
         try:
@@ -98,13 +111,11 @@ def parse_ad_page(html, url):
         except ValueError:
             area = None
 
-    # --- Strukturierte Felder sammeln ---
     details = {}
     for dl in soup.find_all("dl"):
         for dt, dd in zip(dl.find_all("dt"), dl.find_all("dd")):
             details[dt.get_text(strip=True)] = dd.get_text(strip=True)
 
-    # --- Zimmer ---
     rooms = None
     if "Zimmer" in details:
         val = details["Zimmer"]
@@ -116,20 +127,14 @@ def parse_ad_page(html, url):
         elif (m := re.search(r"(?:Zimmer|Zi)\s*[:\-]?\s*(\d{1,2}(?:[.,]\d)?)\b", text, re.I)):
             rooms = float(m.group(1).replace(",", "."))
 
-    # --- Baujahr ---
     year_built = None
     if "Baujahr" in details:
-        if (m := re.search(r"(\d{4})", details["Baujahr"])):
-            year_built = int(m.group(1))
-    elif (m := re.search(r"[Bb]aujahr[:\s]+(\d{4})", text)):
-        year_built = int(m.group(1))
+        if (m := re.search(r"(\d{4})", details["Baujahr"])): year_built = int(m.group(1))
+    elif (m := re.search(r"[Bb]aujahr[:\s]+(\d{4})", text)): year_built = int(m.group(1))
 
-    # --- Ort (PLZ + Stadtteil) ---
     ort = None
-    if (m := re.search(r"\b(\d{5}\s+[A-ZÄÖÜa-zäöüß\- ]+)\b", text)):
-        ort = m.group(1).strip()
+    if (m := re.search(r"\b(\d{5}\s+[A-ZÄÖÜa-zäöüß\- ]+)\b", text)): ort = m.group(1).strip()
 
-    # --- Hausgeld / Kaltmiete ---
     def extract_val(label):
         val = details.get(label)
         if val and (m := re.search(r"([\d\.\s,]+)", val)):
@@ -144,25 +149,14 @@ def parse_ad_page(html, url):
     if kaltmiete is None and (m := re.search(r"Kaltmiete[:\s]+([\d\.\s,]+)\s*(€|EUR)", text, re.I)):
         kaltmiete = parse_price(m.group(1))
 
-    # --- Bild ---
     img = soup.select_one("img[src*='https://img.kleinanzeigen.de']")
     img_url = img["src"] if img else None
 
     return {
-        "url": url,
-        "title": title,
-        "price": price,
-        "vb": vb_flag,
-        "area": area,
-        "rooms": rooms,
-        "year_built": year_built,
-        "ort": ort,
-        "image": img_url,
-        "hausgeld": hausgeld,
-        "kaltmiete": kaltmiete,
+        "url": url, "title": title, "price": price, "vb": vb_flag,
+        "area": area, "rooms": rooms, "year_built": year_built,
+        "ort": ort, "image": img_url, "hausgeld": hausgeld, "kaltmiete": kaltmiete,
     }
-
-
 
 def build_page_url(base, n):
     p = urlsplit(base)
@@ -172,7 +166,6 @@ def build_page_url(base, n):
         return base
     new = path[:idx] + f"/seite:{n}" + path[idx:]
     return urlunsplit((p.scheme, p.netloc, new, p.query, p.fragment))
-
 
 def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
     base = f"{urlparse(url).scheme}://{urlparse(url).netloc}"
@@ -190,7 +183,7 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
     if total == 0:
         return pd.DataFrame()
 
-    total_time = int(total * 1.7)
+    total_time = int(total * 0.7)
     pb = pb_placeholder.progress(0)
     start_time = time.time()
     results = []
@@ -199,7 +192,6 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
         elapsed = time.time() - start_time
         remaining = max(int(total_time - elapsed), 0)
         mins, secs = divmod(remaining, 60)
-
         if remaining > 0:
             countdown_placeholder.markdown(
                 f"<div style='display:flex;align-items:center;gap:6px;'>"
@@ -212,13 +204,11 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
             )
         else:
             countdown_placeholder.markdown("✅ Fertig!")
-
         try:
             html = get_html(link)
             results.append(parse_ad_page(html, link))
         except Exception:
             pass
-
         pb.progress(i / total)
         time.sleep(random.uniform(*delay))
 
@@ -235,11 +225,11 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
         )
     return df
 
-
 # =====================================================
 # Sidebar + Filter
 # =====================================================
 st.sidebar.header("🏠 IMMOnitor")
+
 ort = st.sidebar.selectbox("Ort", orte_liste, index=None, placeholder="Ort wählen…")
 radius_opts = {"Ganzer Ort": "", "+5 km": "r5", "+10 km": "r10", "+20 km": "r20", "+30 km": "r30", "+50 km": "r50"}
 radius = st.sidebar.selectbox("Radius", list(radius_opts.keys()))
@@ -247,7 +237,7 @@ pb_placeholder = st.sidebar.empty()
 countdown_placeholder = st.sidebar.empty()
 
 # =====================================================
-# Scraping
+# Scraping mit Cache
 # =====================================================
 if ort:
     slug = orte_df.loc[orte_df["name"] == ort, "slug"].values[0]
@@ -256,7 +246,12 @@ if ort:
         with st.spinner("Scraping läuft …"):
             df = scrape_all(base, pb_placeholder, countdown_placeholder)
         if not df.empty:
+            save_cached_data(df, ort, radius)
             st.session_state["scraped_df"] = df
+    else:
+        cached = load_cached_data(ort, radius)
+        if cached is not None:
+            st.session_state["scraped_df"] = cached
 
 # =====================================================
 # Anzeige
@@ -264,17 +259,19 @@ if ort:
 if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty:
     df = st.session_state["scraped_df"].copy()
 
-    # --- Ortsübliche Referenzpreise ---
+    # Zeitstempel anzeigen
+    scraped_time = df.attrs.get("scraped_at", None)
+    if scraped_time:
+        st.markdown(f"🕒 **Daten zuletzt aktualisiert am:** {scraped_time}")
+
     @st.cache_data
     def load_reference_prices():
         return pd.read_csv("data/ergebnisse.csv", dtype={"plz": str})
 
     preise_df = load_reference_prices()
-
     df["plz"] = df["ort"].str.extract(r"(\d{5})")
     df = df.merge(preise_df, on="plz", how="left")
 
-    # --- Deal-Faktor ---
     df["deal_score"] = df.apply(
         lambda r: round(r["price_per_m2"] / r["avg_offiziell"], 2)
         if pd.notnull(r["price_per_m2"]) and pd.notnull(r["avg_offiziell"]) and r["avg_offiziell"] > 0
@@ -282,7 +279,7 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
         axis=1,
     )
 
-    # --- Filter ---
+    # --- Filter
     min_price = st.sidebar.number_input("Preis ab (€)", 0, 10_000_000, 0, step=10_000)
     max_price = st.sidebar.number_input("Preis bis (€)", 0, 10_000_000, 2_000_000, step=10_000)
     min_qmprice = st.sidebar.number_input("€/m² ab", 0, 50_000, 0, step=50)
@@ -294,7 +291,6 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
     min_year = st.sidebar.number_input("Baujahr ab", 1800, 2100, 1900)
     max_year = st.sidebar.number_input("Baujahr bis", 1800, 2100, 2100)
 
-    # --- Filterlogik ---
     def safe_between(series, low, high):
         return series.fillna((low + high) / 2).between(low, high)
 
@@ -306,26 +302,23 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
         & safe_between(df["year_built"], min_year, max_year)
     ]
 
-    # --- Sortierung (bleibt wie gehabt) ---
     sort_choice = st.selectbox(
         "Sortiere nach",
         [
+            "Bester Deal (Verhältnis zum Ø Ortspreis)",
             "Preis aufsteigend",
             "Preis absteigend",
             "Preis pro m² aufsteigend",
-            "Preis pro m² absteigend",
-            "🏆 Bester Deal (Verhältnis zum Ø Ortspreis)",
-            "💸 Günstigste €/m² zuerst"
+            "Preis pro m² absteigend"#,
+            #"Günstigste €/m² zuerst"
         ],
         key="sort_choice"
     )
 
     if "Deal" in sort_choice:
-        sort_col = "deal_score"
-        ascending = True
+        sort_col = "deal_score"; ascending = True
     elif "Günstigste" in sort_choice:
-        sort_col = "price_per_m2"
-        ascending = True
+        sort_col = "price_per_m2"; ascending = True
     else:
         sort_col = "price_per_m2" if "Preis pro m²" in sort_choice else "price"
         ascending = "aufsteigend" in sort_choice
@@ -333,15 +326,11 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
     df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
     df = df.sort_values(sort_col, ascending=ascending, na_position="last")
 
-    # =====================================================
-    # Anzeige-Kacheln (klassisch)
-    # =====================================================
     n_cols = 3
     for i in range(0, len(df), n_cols):
         cols = st.columns(n_cols, gap="large")
         for j, col in enumerate(cols):
-            if i + j >= len(df):
-                break
+            if i + j >= len(df): break
             row = df.iloc[i + j]
 
             price_display = "VB" if row.get("vb") and row["price"] == 0 else (
@@ -389,4 +378,3 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
                         </div>
                     </div>
                 """, unsafe_allow_html=True)
-
