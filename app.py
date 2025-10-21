@@ -183,7 +183,7 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
     if total == 0:
         return pd.DataFrame()
 
-    total_time = int(total * 0.7)
+    total_time = int(total * 1)
     pb = pb_placeholder.progress(0)
     start_time = time.time()
     results = []
