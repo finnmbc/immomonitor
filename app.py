@@ -1,6 +1,6 @@
 import streamlit as st
 import pandas as pd
-import time, random, re, requests, os, hashlib
+import time, random, re, requests
 from bs4 import BeautifulSoup
 from urllib.parse import urljoin, urlparse, urlsplit, urlunsplit
 
@@ -16,33 +16,9 @@ def load_locations():
 orte_df = load_locations()
 orte_liste = orte_df["name"].tolist()
 
-HEADERS = {"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36"}
-
-# =====================================================
-# Cache-Setup (lokal)
-# =====================================================
-CACHE_DIR = "cache"
-os.makedirs(CACHE_DIR, exist_ok=True)
-
-def cache_filename(ort, radius):
-    key = f"{ort}_{radius}"
-    key_hash = hashlib.md5(key.encode()).hexdigest()
-    return os.path.join(CACHE_DIR, f"{key_hash}.parquet")
-
-def save_cached_data(df, ort, radius):
-    path = cache_filename(ort, radius)
-    df.attrs["scraped_at"] = time.strftime("%d.%m.%Y %H:%M:%S")
-    df.to_parquet(path)
-
-def load_cached_data(ort, radius, max_age_hours=24):
-    path = cache_filename(ort, radius)
-    if os.path.exists(path):
-        age_hours = (time.time() - os.path.getmtime(path)) / 3600
-        if age_hours < max_age_hours:
-            df = pd.read_parquet(path)
-            df.attrs["scraped_at"] = df.attrs.get("scraped_at", time.strftime("%d.%m.%Y %H:%M:%S"))
-            return df
-    return None
+HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) Chrome/120 Safari/537.36"
+}
 
 # =====================================================
 # Scraper-Funktionen
@@ -183,7 +159,7 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
     if total == 0:
         return pd.DataFrame()
 
-    total_time = int(total * 1)
+    total_time = int(total * 0.8)
     pb = pb_placeholder.progress(0)
     start_time = time.time()
     results = []
@@ -230,6 +206,40 @@ def scrape_all(url, pb_placeholder, countdown_placeholder, delay=(0.1, 0.2)):
 # =====================================================
 st.sidebar.header("🏠 IMMOnitor")
 
+# "Alle Orte laden" Button
+if st.sidebar.button("🌍 Alle Orte laden"):
+    with st.spinner("Lade alle Orte..."):
+        all_results = []
+        total_orte = len(orte_df)
+        status_placeholder = st.sidebar.empty()
+        progress_bar = st.sidebar.progress(0)
+
+        for idx, row in enumerate(orte_df.itertuples(), start=1):
+            name = row.name
+            slug = row.slug
+            url = f"https://www.kleinanzeigen.de/s-wohnung-kaufen/{slug}"
+
+            # Anzeige welcher Ort gerade geladen wird
+            status_placeholder.markdown(f"🔄 **{idx}/{total_orte} – {name}**")
+
+            try:
+                df_part = scrape_all(url, st.empty(), st.empty())
+                if not df_part.empty:
+                    df_part["ort_auswahl"] = name
+                    all_results.append(df_part)
+            except Exception:
+                pass
+
+            # Fortschrittsbalken aktualisieren
+            progress_bar.progress(idx / total_orte)
+
+        progress_bar.empty()
+        status_placeholder.markdown("✅ **Fertig!**")
+
+        if all_results:
+            st.session_state["scraped_df"] = pd.concat(all_results, ignore_index=True)
+            st.session_state["scraped_time"] = time.strftime("%d.%m.%Y %H:%M:%S")
+
 ort = st.sidebar.selectbox("Ort", orte_liste, index=None, placeholder="Ort wählen…")
 radius_opts = {"Ganzer Ort": "", "+5 km": "r5", "+10 km": "r10", "+20 km": "r20", "+30 km": "r30", "+50 km": "r50"}
 radius = st.sidebar.selectbox("Radius", list(radius_opts.keys()))
@@ -237,7 +247,7 @@ pb_placeholder = st.sidebar.empty()
 countdown_placeholder = st.sidebar.empty()
 
 # =====================================================
-# Scraping mit Cache
+# Scraping (einzeln)
 # =====================================================
 if ort:
     slug = orte_df.loc[orte_df["name"] == ort, "slug"].values[0]
@@ -246,12 +256,8 @@ if ort:
         with st.spinner("Scraping läuft …"):
             df = scrape_all(base, pb_placeholder, countdown_placeholder)
         if not df.empty:
-            save_cached_data(df, ort, radius)
             st.session_state["scraped_df"] = df
-    else:
-        cached = load_cached_data(ort, radius)
-        if cached is not None:
-            st.session_state["scraped_df"] = cached
+            st.session_state["scraped_time"] = time.strftime("%d.%m.%Y %H:%M:%S")
 
 # =====================================================
 # Anzeige
@@ -259,8 +265,8 @@ if ort:
 if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty:
     df = st.session_state["scraped_df"].copy()
 
-    # Zeitstempel anzeigen
-    scraped_time = df.attrs.get("scraped_at", None)
+    # Zeit anzeigen
+    scraped_time = st.session_state.get("scraped_time", None)
     if scraped_time:
         st.markdown(f"🕒 **Daten zuletzt aktualisiert am:** {scraped_time}")
 
@@ -279,7 +285,7 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
         axis=1,
     )
 
-    # --- Filter
+    # Filter
     min_price = st.sidebar.number_input("Preis ab (€)", 0, 10_000_000, 0, step=10_000)
     max_price = st.sidebar.number_input("Preis bis (€)", 0, 10_000_000, 2_000_000, step=10_000)
     min_qmprice = st.sidebar.number_input("€/m² ab", 0, 50_000, 0, step=50)
@@ -305,12 +311,12 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
     sort_choice = st.selectbox(
         "Sortiere nach",
         [
-            "Bester Deal (Verhältnis zum Ø Ortspreis)",
             "Preis aufsteigend",
             "Preis absteigend",
             "Preis pro m² aufsteigend",
-            "Preis pro m² absteigend"#,
-            #"Günstigste €/m² zuerst"
+            "Preis pro m² absteigend",
+            "🏆 Bester Deal (Verhältnis zum Ø Ortspreis)",
+            "💸 Günstigste €/m² zuerst"
         ],
         key="sort_choice"
     )
@@ -326,6 +332,9 @@ if "scraped_df" in st.session_state and not st.session_state["scraped_df"].empty
     df[sort_col] = pd.to_numeric(df[sort_col], errors="coerce")
     df = df.sort_values(sort_col, ascending=ascending, na_position="last")
 
+    # =====================================================
+    # Anzeige-Kacheln
+    # =====================================================
     n_cols = 3
     for i in range(0, len(df), n_cols):
         cols = st.columns(n_cols, gap="large")
